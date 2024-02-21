@@ -18,25 +18,26 @@
 WiFiClient espClient;
 PubSubClient mqtt_client(espClient);
 SDS011 sds;
-unsigned long lastTempSend;
+unsigned long lastTempSend = 0;
 const char* controller_sw_version = "20240212";
 ezLED blueLed(LED_BUILTIN, CTRL_CATHODE);
 
 
 // topics with idconst char* dustsensor_id_availability_topic;
-const char* clientTopic(const char* topicTemplate) {
+const char* clientTopic(const char* topicTemplate,const char* measure="") {
   String topic = String(topicTemplate);
   topic.replace("{id}", String(ESP.getChipId()));
+  topic.replace("{m}", measure);
   void* presult = malloc(topic.length() + 1);
   // copy
   strcpy((char*)presult, topic.c_str());
   return (char*)presult;
 }
 
-const char* dustsensor_id_topic = clientTopic(dustsensor_topic);
-const char* dustsensor_id_availability_topic = clientTopic(dustsensor_availability_topic);     
-const char* dustsensor_id_current_topic = clientTopic(dustsensor_current_topic);
+const char* dustsensor_id_availability_topic = clientTopic(dustsensor_availability_topic); 
 const char* dustsensor_id_debug_topic = clientTopic(dustsensor_debug_topic);
+const char* dustsensor_id_topic = clientTopic(dustsensor_topic);    
+const char* dustsensor_id_current_topic = clientTopic(dustsensor_current_topic);
     
 
 int mqttConnect() {
@@ -75,22 +76,22 @@ int mqttConnect() {
   return 0;
 }
 
-void mqttAutoDiscovery() {
+void mqttAutoDiscoveryPM25() {
   const String chip_id = String(ESP.getChipId());
-  const String mqtt_discov_topic = String(mqtt_discov_prefix) + "/climate/" + chip_id + "/config";
+  const String mqtt_discov_topic = String(mqtt_discov_prefix) + "/sensor/pm25/" + chip_id + "/config";
   const char* root_topic = dustsensor_id_topic;
   Serial1.println(root_topic);
   JsonDocument rootDiscovery;
 
-  rootDiscovery["name"] = name;
-  rootDiscovery["uniq_id"] = chip_id;
+  rootDiscovery["name"] = String(name) + " PM25";
+  rootDiscovery["device_class"] = "pm25";
+  
+  rootDiscovery["uniq_id"] = chip_id + "_pm25";
   rootDiscovery["~"] = root_topic;
-  rootDiscovery["unit"] = "µg/m³";
+  rootDiscovery["unit_of_measurement"] = "µg/m³";
+  rootDiscovery["state_topic"] = "~/tele/curr";
   rootDiscovery["avty_t"] = "~/tele/avty";
-
-  rootDiscovery["current"] = "~/tele/curr";
-  rootDiscovery["particulate_matter_10_template"] = "{{ value_json.particulate_matter_10 }}";
-  rootDiscovery["particulate_matter_2_5_template"] = "{{ value_json.particulate_matter_2_5 }}";
+  rootDiscovery["value_template"] = "{{ value_json.particulate_matter_2_5 }}";
   
   JsonObject device = rootDiscovery.createNestedObject("device");
   device["name"] = name;
@@ -109,11 +110,45 @@ void mqttAutoDiscovery() {
   }
 }
 
+void mqttAutoDiscoveryPM10() {
+  const String chip_id = String(ESP.getChipId());
+  const String mqtt_discov_topic = String(mqtt_discov_prefix) + "/sensor/pm10/" + chip_id + "/config";
+  const char* root_topic = dustsensor_id_topic;
+  Serial1.println(root_topic);
+  JsonDocument rootDiscovery;
+
+  rootDiscovery["name"] = String(name) + " PM10";
+  rootDiscovery["device_class"] = "pm10";
+  
+  rootDiscovery["uniq_id"] = chip_id + "_pm10";
+  rootDiscovery["~"] = root_topic;
+  rootDiscovery["unit_of_measurement"] = "µg/m³";
+  rootDiscovery["avty_t"] = "~/tele/avty";
+  rootDiscovery["state_topic"] = "~/tele/curr";
+  rootDiscovery["value_template"] = "{{ value_json.particulate_matter_10 }}";
+  
+  JsonObject device = rootDiscovery.createNestedObject("device");
+  device["name"] = name;
+  JsonArray ids = device.createNestedArray("ids");
+  ids.add(chip_id);
+  device["mf"] = "SDS011 Dust Sensor";
+  device["mdl"] = "SDS011 Dust Sensor";
+  device["sw"] = controller_sw_version;
+
+  char bufferDiscover[2048];
+  serializeJson(rootDiscovery, bufferDiscover);
+
+  mqtt_client.setBufferSize(2048);
+  if (!mqtt_client.publish(mqtt_discov_topic.c_str(), bufferDiscover, true)) {
+    mqtt_client.publish(dustsensor_id_debug_topic, "failed to publish DISCOV topic");
+  }
+}
 
 // callback heat pump status changed, send new status to MQTT dustsensor_current_topic
 // also send timer attribute to MQTT dustsensor_attribute_topic
 // finally update MQTT dustsensor_availability_topic to online status
 void sendData(float p10Value, float p25Value, int error) {
+  Serial1.println("Sending data to MQTT");
   JsonDocument rootInfo;
 
   rootInfo["name"] = name;
@@ -217,16 +252,19 @@ void handleConnection(){
   while (!mqtt_client.connected()) {
     if (mqttConnect() == -1)  // WiFi disconnected
       wifiReconnect();
-    else
-      mqttAutoDiscovery();  // on first connect or reconnect send autodiscovery to HA
+    else{
+      mqttAutoDiscoveryPM10();  // on first connect or reconnect send autodiscovery to HA
+      mqttAutoDiscoveryPM25();  // on first connect or reconnect send autodiscovery to HA
+    }
   }
 }
 
 float p10, p25;
 int err;
 // manage heat pum syncronization and status 
-void handleHeatPumpStatus(){
-  if (millis() > (lastTempSend + SEND_DATA_INTERVAL_MS)) {
+void handleSensorStatus(){
+  if (lastTempSend == 0 || millis() > (lastTempSend + SEND_DATA_INTERVAL_MS)) {
+    Serial1.println("Reading SDS011 sensor");
     blueLed.fade(255, 0, 1000);
     err = sds.read(&p25, &p10);
 	  sendData(p10, p25, err);
@@ -239,6 +277,7 @@ void loop() {
   handleConnection();
   mqtt_client.loop();
   blueLed.loop();
+  handleSensorStatus();
 #ifdef OTA
   ArduinoOTA.handle();
 #endif
